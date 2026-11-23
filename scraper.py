@@ -63,19 +63,32 @@ def parse_price(price_text: str) -> dict:
 
 
 def extract_brands_from_html(html: str) -> list:
-    """Flexible parser for MedEx brand listing cards across layout variations."""
+    """Parses MedEx brand listing entries from body links/rows without false-filtering valid brand links."""
     soup = BeautifulSoup(html, "lxml")
     brands = []
+    seen_in_page = set()
 
-    # Candidate card containers: primary a.hoverable-block, fallback to links pointing to /brands/<id>/...
-    cards = soup.select("a.hoverable-block")
+    # Search inside <body> so <head> links (like favicon/apple-touch-icon) are never touched
+    root = soup.body or soup
+
+    # 1. Primary card selector if present
+    cards = root.select("a.hoverable-block")
+
+    # 2. Fallback: find all anchors pointing to /brands/<id>/... (exclude pagination/sort links)
     if not cards:
-        cards = [
-            a
-            for a in soup.select("a[href]")
-            if re.search(r"/brands/\d+", a.get("href") or "")
-            and any(k in (a.get_text(" ", strip=True).lower()) for k in ["৳", "bdt", "unit price", "strip price", "pack price", "mg", "ml", "%"])
-        ]
+        candidates = []
+        for a in root.select("a[href]"):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+            full_href = f"https://medex.com.bd{href}" if href.startswith("/") else href
+            if not re.search(r"/brands/\d+(?:/|$)", full_href):
+                continue
+            txt = clean_text(a.get_text(" ", strip=True))
+            if not txt or txt.isdigit() or txt.lower() in {"next", "prev", "previous", "last", "first", "«", "»", "‹", "›"}:
+                continue
+            candidates.append(a)
+        cards = candidates
 
     for card in cards:
         href = (card.get("href") or "").strip()
@@ -87,10 +100,22 @@ def extract_brands_from_html(html: str) -> list:
         id_match = re.search(r"/brands/(\d+)", href)
         brand_id = int(id_match.group(1)) if id_match else href
 
-        # 1. Brand Name & Dosage Form
+        if brand_id in seen_in_page:
+            continue
+
+        # Look at parent row/container if the <a> tag itself is just a title link
+        container = card
+        if card.name == "a" and card.parent and card.parent.name in ("div", "li", "tr"):
+            parent_txt = clean_text(card.parent.get_text(" ", strip=True))
+            card_txt = clean_text(card.get_text(" ", strip=True))
+            # Use parent row if it is a compact row (< 500 chars) containing extra fields
+            if 0 < len(parent_txt) < 500 and len(parent_txt) >= len(card_txt):
+                container = card.parent
+
+        # Brand Name & Dosage Form
         dosage = ""
         name = ""
-        top_row = card.select_one(".data-row-top, .brand-name, .row-title, h1, h2, h3, h4, strong, b")
+        top_row = container.select_one(".data-row-top, .brand-name, .row-title")
         if top_row:
             dosage_el = top_row.select_one(".grey-ligten, .dosage-form, .form, small, span.text-muted")
             if dosage_el:
@@ -98,36 +123,64 @@ def extract_brands_from_html(html: str) -> list:
                 dosage_el.decompose()
             name = clean_text(top_row.get_text(" ", strip=True))
 
-        # 2. Strength
+        if not name:
+            # Extract name from the /brands/<id>/<slug> anchor itself
+            anchor_el = card if card.name == "a" else container.select_one("a[href*='/brands/']")
+            if anchor_el:
+                # Clone/inspect children if small, else use anchor text
+                raw_anchor = clean_text(anchor_el.get_text(" ", strip=True))
+                # Sometimes dosage form is in a child span/small/badge
+                sub_dosage = anchor_el.select_one("span, small, .grey-ligten, .dosage-form")
+                if sub_dosage and len(clean_text(sub_dosage.get_text(" ", strip=True))) < 35:
+                    dosage = clean_text(sub_dosage.get_text(" ", strip=True))
+                    name = clean_text(raw_anchor.replace(dosage, "", 1))
+                else:
+                    name = raw_anchor
+
+        # Fallback name from URL slug if still empty
+        if not name and isinstance(brand_id, int):
+            slug_m = re.search(r"/brands/\d+/([^/?#]+)", href)
+            if slug_m:
+                name = slug_m.group(1).replace("-", " ").title()
+
+        if not name:
+            continue
+
+        # Strength
         strength = ""
-        strength_el = card.select_one(".data-row-strength, .strength, .drug-strength")
+        strength_el = container.select_one(".data-row-strength, .strength, .drug-strength")
         if strength_el:
             strength = clean_text(strength_el.get_text(" ", strip=True))
         else:
-            for el in card.select("span, small, div"):
+            for el in container.select("span, small, div, li"):
                 txt = clean_text(el.get_text(" ", strip=True))
-                if txt and txt != name and re.search(r"\b\d+(?:\.\d+)?\s*(?:mg|ml|mcg|g|iu|%)\b", txt, re.I) and len(txt) < 60:
+                if (
+                    txt
+                    and txt != name
+                    and len(txt) < 70
+                    and re.search(r"\b\d+(?:\.\d+)?\s*(?:mg|ml|mcg|g|iu|%)\b", txt, re.I)
+                ):
                     strength = txt
                     break
 
-        # 3. Manufacturer / Company
+        # Manufacturer / Company
         company = ""
-        company_el = card.select_one(".data-row-company, .company-name, .manufacturer, .pharmaceutical")
+        company_el = container.select_one(".data-row-company, .company-name, .manufacturer, .pharmaceutical")
         if company_el:
             company = clean_text(company_el.get_text(" ", strip=True))
 
-        # 4. Generic Name & extra non-pricing labels
+        # Generic Name & extra non-pricing labels
         generic = ""
         extra_labels = []
-        gen_el = card.select_one("[title*='Generic' i], .generic-name, .data-row-generic")
+        gen_el = container.select_one("[title*='Generic' i], .generic-name, .data-row-generic")
         if gen_el:
             generic = clean_text(gen_el.get_text(" ", strip=True))
 
-        for div in card.select("div, span, p, small"):
-            if div.find(["div", "p"]):
+        for el in container.select("div, span, p, small, li"):
+            if el.find(["div", "p", "ul", "ol", "table"]):
                 continue
-            txt = clean_text(div.get_text(" ", strip=True))
-            if not txt:
+            txt = clean_text(el.get_text(" ", strip=True))
+            if not txt or txt.isdigit() or txt.lower() in {"view details", "details", "more"}:
                 continue
             if any(tok in txt.lower() for tok in ["৳", "bdt", "unit price", "strip price", "pack price"]):
                 continue
@@ -138,15 +191,15 @@ def extract_brands_from_html(html: str) -> list:
             elif txt not in extra_labels and len(txt) < 140:
                 extra_labels.append(txt)
 
-        # 5. Pricing & pack details
-        price_el = card.select_one(".package-pricing, .price, .pricing")
+        # Pricing & pack details
+        price_el = container.select_one(".package-pricing, .price, .pricing")
         if price_el:
             raw_price_text = price_el.get_text(" ", strip=True)
         else:
-            card_full = clean_text(card.get_text(" ", strip=True))
+            full_txt = clean_text(container.get_text(" ", strip=True))
             price_chunks = re.findall(
-                r"(?:Unit Price|Strip Price|Pack Price)?\s*:?\s*(?:৳|BDT|Tk\.?)\s*[\d,]+(?:\.\d+)?",
-                card_full,
+                r"(?:Unit Price|Strip Price|Pack Price)?\s*:?\s*(?:৳|BDT|Tk\.?|เงณ)\s*[\d,]+(?:\.\d+)?",
+                full_txt,
                 re.I,
             )
             raw_price_text = " | ".join(price_chunks)
@@ -166,23 +219,23 @@ def extract_brands_from_html(html: str) -> list:
             if non_price:
                 pack_details = " | ".join(dict.fromkeys(non_price))
 
-        if name:
-            brands.append(
-                {
-                    "id": brand_id,
-                    "name": name,
-                    "dosage_form": dosage,
-                    "strength": strength,
-                    "generic": generic,
-                    "manufacturer": company,
-                    "unit_price": price_info["unit_price"],
-                    "pack_price": price_info["pack_price"],
-                    "raw_price": price_info["raw_price"],
-                    "pack_details": pack_details,
-                    "extra_info": extra_labels,
-                    "url": href,
-                }
-            )
+        seen_in_page.add(brand_id)
+        brands.append(
+            {
+                "id": brand_id,
+                "name": name,
+                "dosage_form": dosage,
+                "strength": strength,
+                "generic": generic,
+                "manufacturer": company,
+                "unit_price": price_info["unit_price"],
+                "pack_price": price_info["pack_price"],
+                "raw_price": price_info["raw_price"],
+                "pack_details": pack_details,
+                "extra_info": extra_labels,
+                "url": href,
+            }
+        )
 
     return brands
 
@@ -405,13 +458,22 @@ async def main():
         all_medicines = []
         seen_ids = set()
 
-        # Parse page 1 first so we have immediate results and diagnostic visibility
         page1_items = extract_brands_from_html(first_html)
         for item in page1_items:
             if item["id"] not in seen_ids:
                 seen_ids.add(item["id"])
                 all_medicines.append(item)
         print(f"Page 1 parsed: {len(all_medicines)} medicines")
+
+        if len(all_medicines) == 0:
+            body_soup = BeautifulSoup(first_html, "lxml").body
+            body_text = clean_text(body_soup.get_text(" | ", strip=True))[:500] if body_soup else ""
+            sample_hrefs = [
+                a.get("href") for a in (body_soup.select("a[href]") if body_soup else [])[:15]
+            ]
+            raise RuntimeError(
+                f"0 medicines parsed on Page 1. Sample hrefs: {sample_hrefs} | Body text: {body_text}"
+            )
 
         batch_size = 50
         for start in range(2, total_pages + 1, batch_size):
@@ -427,12 +489,6 @@ async def main():
 
             print(
                 f"Processed listing pages {start}-{end} | Unique medicines: {len(all_medicines)}"
-            )
-
-        if not all_medicines:
-            snippet = clean_text(first_html)[:400]
-            raise RuntimeError(
-                f"Scraper fetched 0 medicines. Page 1 HTML snippet: {snippet}"
             )
 
         all_medicines.sort(
