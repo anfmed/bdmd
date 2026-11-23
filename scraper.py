@@ -17,8 +17,8 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
-LISTING_CONCURRENCY = 8
-DETAIL_CONCURRENCY = 5  # Conservative concurrency for detail pages to avoid rate limits
+LISTING_CONCURRENCY = 6
+DETAIL_CONCURRENCY = 4
 
 
 def clean_text(text: str) -> str:
@@ -28,14 +28,12 @@ def clean_text(text: str) -> str:
 
 
 def slugify_key(label: str) -> str:
-    """Converts section heading like 'Dosage & Administration' -> 'dosage_and_administration'."""
     s = label.lower().replace("&", "and")
     s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
     return s or "section"
 
 
 def parse_price(price_text: str) -> dict:
-    """Extracts clean float unit_price and pack_price from MedEx pricing text."""
     raw = clean_text(price_text)
     result = {
         "unit_price": None,
@@ -46,18 +44,18 @@ def parse_price(price_text: str) -> dict:
         return result
 
     unit_match = re.search(
-        r"Unit Price:\s*৳?\s*([\d,]+(?:\.\d+)?)", raw, re.I
+        r"Unit Price:\s*(?:৳|BDT|Tk\.?|เงณ)?\s*([\d,]+(?:\.\d+)?)", raw, re.I
     )
     if unit_match:
         result["unit_price"] = float(unit_match.group(1).replace(",", ""))
 
     pack_match = re.search(
-        r"(?:Strip|Pack)\s*Price:\s*৳?\s*([\d,]+(?:\.\d+)?)", raw, re.I
+        r"(?:Strip|Pack)\s*Price:\s*(?:৳|BDT|Tk\.?|เงณ)?\s*([\d,]+(?:\.\d+)?)", raw, re.I
     )
     if pack_match:
         result["pack_price"] = float(pack_match.group(1).replace(",", ""))
     elif result["unit_price"] is None:
-        single_match = re.search(r"৳\s*([\d,]+(?:\.\d+)?)", raw)
+        single_match = re.search(r"(?:৳|BDT|Tk\.?|เงณ)\s*([\d,]+(?:\.\d+)?)", raw, re.I)
         if single_match:
             result["unit_price"] = float(single_match.group(1).replace(",", ""))
 
@@ -65,60 +63,94 @@ def parse_price(price_text: str) -> dict:
 
 
 def extract_brands_from_html(html: str) -> list:
-    """Parses all brand cards from a single MedEx brands listing page."""
+    """Flexible parser for MedEx brand listing cards across layout variations."""
     soup = BeautifulSoup(html, "lxml")
     brands = []
 
+    # Candidate card containers: primary a.hoverable-block, fallback to links pointing to /brands/<id>/...
     cards = soup.select("a.hoverable-block")
+    if not cards:
+        cards = [
+            a
+            for a in soup.select("a[href]")
+            if re.search(r"/brands/\d+", a.get("href") or "")
+            and any(k in (a.get_text(" ", strip=True).lower()) for k in ["৳", "bdt", "unit price", "strip price", "pack price", "mg", "ml", "%"])
+        ]
+
     for card in cards:
         href = (card.get("href") or "").strip()
         if not href:
             continue
+        if href.startswith("/"):
+            href = f"https://medex.com.bd{href}"
 
         id_match = re.search(r"/brands/(\d+)", href)
         brand_id = int(id_match.group(1)) if id_match else href
 
-        top_row = card.select_one(".data-row-top")
+        # 1. Brand Name & Dosage Form
         dosage = ""
         name = ""
+        top_row = card.select_one(".data-row-top, .brand-name, .row-title, h1, h2, h3, h4, strong, b")
         if top_row:
-            dosage_el = top_row.select_one(".grey-ligten")
+            dosage_el = top_row.select_one(".grey-ligten, .dosage-form, .form, small, span.text-muted")
             if dosage_el:
                 dosage = clean_text(dosage_el.get_text(" ", strip=True))
                 dosage_el.decompose()
             name = clean_text(top_row.get_text(" ", strip=True))
 
-        strength_el = card.select_one(".data-row-strength")
-        strength = clean_text(strength_el.get_text(" ", strip=True)) if strength_el else ""
+        # 2. Strength
+        strength = ""
+        strength_el = card.select_one(".data-row-strength, .strength, .drug-strength")
+        if strength_el:
+            strength = clean_text(strength_el.get_text(" ", strip=True))
+        else:
+            for el in card.select("span, small, div"):
+                txt = clean_text(el.get_text(" ", strip=True))
+                if txt and txt != name and re.search(r"\b\d+(?:\.\d+)?\s*(?:mg|ml|mcg|g|iu|%)\b", txt, re.I) and len(txt) < 60:
+                    strength = txt
+                    break
 
-        company_el = card.select_one(".data-row-company")
-        company = clean_text(company_el.get_text(" ", strip=True)) if company_el else ""
+        # 3. Manufacturer / Company
+        company = ""
+        company_el = card.select_one(".data-row-company, .company-name, .manufacturer, .pharmaceutical")
+        if company_el:
+            company = clean_text(company_el.get_text(" ", strip=True))
 
+        # 4. Generic Name & extra non-pricing labels
         generic = ""
         extra_labels = []
-        for div in card.select("div"):
-            classes = div.get("class") or []
-            if any(
-                c in classes
-                for c in [
-                    "data-row-top",
-                    "data-row-strength",
-                    "data-row-company",
-                    "package-pricing",
-                    "col-xs-12",
-                    "row",
-                ]
-            ):
-                continue
-            text = clean_text(div.get_text(" ", strip=True))
-            if text and "৳" not in text and text not in (name, dosage, strength, company):
-                if not generic:
-                    generic = text
-                elif text not in extra_labels and text != generic:
-                    extra_labels.append(text)
+        gen_el = card.select_one("[title*='Generic' i], .generic-name, .data-row-generic")
+        if gen_el:
+            generic = clean_text(gen_el.get_text(" ", strip=True))
 
-        price_el = card.select_one(".package-pricing")
-        raw_price_text = price_el.get_text(" ", strip=True) if price_el else ""
+        for div in card.select("div, span, p, small"):
+            if div.find(["div", "p"]):
+                continue
+            txt = clean_text(div.get_text(" ", strip=True))
+            if not txt:
+                continue
+            if any(tok in txt.lower() for tok in ["৳", "bdt", "unit price", "strip price", "pack price"]):
+                continue
+            if txt in (name, dosage, strength, company, generic):
+                continue
+            if not generic and len(txt) < 120:
+                generic = txt
+            elif txt not in extra_labels and len(txt) < 140:
+                extra_labels.append(txt)
+
+        # 5. Pricing & pack details
+        price_el = card.select_one(".package-pricing, .price, .pricing")
+        if price_el:
+            raw_price_text = price_el.get_text(" ", strip=True)
+        else:
+            card_full = clean_text(card.get_text(" ", strip=True))
+            price_chunks = re.findall(
+                r"(?:Unit Price|Strip Price|Pack Price)?\s*:?\s*(?:৳|BDT|Tk\.?)\s*[\d,]+(?:\.\d+)?",
+                card_full,
+                re.I,
+            )
+            raw_price_text = " | ".join(price_chunks)
+
         price_info = parse_price(raw_price_text)
 
         pack_details = ""
@@ -129,7 +161,7 @@ def extract_brands_from_html(html: str) -> list:
                 if el.get_text(strip=True)
             ]
             non_price = [
-                s for s in pack_spans if "৳" not in s and "price" not in s.lower()
+                s for s in pack_spans if not any(k in s.lower() for k in ["৳", "bdt", "price"])
             ]
             if non_price:
                 pack_details = " | ".join(dict.fromkeys(non_price))
@@ -156,7 +188,6 @@ def extract_brands_from_html(html: str) -> list:
 
 
 def extract_detail_from_html(html: str, brand: dict) -> dict:
-    """Extracts clinical monograph sections (Indication, Dosage, Side Effects, etc.) from a brand detail page."""
     soup = BeautifulSoup(html, "lxml")
 
     detail = {
@@ -187,12 +218,11 @@ def extract_detail_from_html(html: str, brand: dict) -> dict:
         "all_sections": {},
     }
 
-    # Generic link if available
     gen_link = soup.select_one("a[href*='/generics/']")
     if gen_link and gen_link.get("href"):
-        detail["generic_url"] = gen_link.get("href").strip()
+        g_href = gen_link.get("href").strip()
+        detail["generic_url"] = f"https://medex.com.bd{g_href}" if g_href.startswith("/") else g_href
 
-    # Map common MedEx section headers to normalized keys
     header_map = {
         "indication": "indications",
         "indications": "indications",
@@ -217,19 +247,15 @@ def extract_detail_from_html(html: str, brand: dict) -> dict:
         "storage conditions": "storage_conditions",
     }
 
-    # MedEx detail pages use .ac-header followed by .ac-body
     headers = soup.select(".ac-header")
     for hdr in headers:
         title = clean_text(hdr.get_text(" ", strip=True))
         body = hdr.find_next_sibling(class_="ac-body")
-        if not body:
-            parent = hdr.parent
-            if parent:
-                body = parent.select_one(".ac-body")
+        if not body and hdr.parent:
+            body = hdr.parent.select_one(".ac-body")
         if not body:
             continue
 
-        # Preserve line breaks for bullet/paragraph readability
         for br in body.find_all("br"):
             br.replace_with("\n")
         raw_body = body.get_text("\n", strip=True)
@@ -254,18 +280,18 @@ def extract_detail_from_html(html: str, brand: dict) -> dict:
     return detail
 
 
-async def get_total_pages(client: httpx.AsyncClient) -> int:
+async def get_total_pages(client: httpx.AsyncClient) -> tuple[int, str]:
     resp = await client.get(BASE_URL, headers=HEADERS, timeout=30.0)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
 
     page_numbers = []
-    for link in soup.select("ul.pagination li a"):
+    for link in soup.select("ul.pagination li a, .pagination a, nav a"):
         text = link.get_text(strip=True)
         if text.isdigit():
             page_numbers.append(int(text))
 
-    return max(page_numbers) if page_numbers else 1
+    return (max(page_numbers) if page_numbers else 1), resp.text
 
 
 async def fetch_listing_page(
@@ -318,7 +344,6 @@ def filter_brands_for_details(
     ids: str = "",
     limit: int = 0,
 ) -> list:
-    """Selects which brands should have their detail pages scraped."""
     if mode == "none":
         return []
 
@@ -354,34 +379,19 @@ async def main():
         "--details-mode",
         choices=["none", "filter", "all"],
         default=os.getenv("DETAILS_MODE", "none"),
-        help="none = listing only; filter = specific names/generics/ids; all = all medicines",
     )
-    parser.add_argument(
-        "--names",
-        default=os.getenv("FILTER_NAMES", ""),
-        help="Comma-separated brand names to match (e.g. 'Napa,Seclo,Sergel')",
-    )
-    parser.add_argument(
-        "--generics",
-        default=os.getenv("FILTER_GENERICS", ""),
-        help="Comma-separated generic names to match (e.g. 'Paracetamol,Omeprazole')",
-    )
-    parser.add_argument(
-        "--ids",
-        default=os.getenv("FILTER_IDS", ""),
-        help="Comma-separated brand IDs to match (e.g. '1234,5678')",
-    )
+    parser.add_argument("--names", default=os.getenv("FILTER_NAMES", ""))
+    parser.add_argument("--generics", default=os.getenv("FILTER_GENERICS", ""))
+    parser.add_argument("--ids", default=os.getenv("FILTER_IDS", ""))
     parser.add_argument(
         "--limit",
         type=int,
         default=int(os.getenv("DETAILS_LIMIT", "0") or 0),
-        help="Optional max number of detail pages to fetch in one run (0 = no limit)",
     )
     parser.add_argument(
         "--skip-existing-details",
         action="store_true",
         default=os.getenv("SKIP_EXISTING_DETAILS", "true").lower() == "true",
-        help="Skip fetching detail pages already saved in data/details/<id>.json",
     )
     args = parser.parse_args()
 
@@ -389,14 +399,22 @@ async def main():
     list_sem = asyncio.Semaphore(LISTING_CONCURRENCY)
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        total_pages = await get_total_pages(client)
+        total_pages, first_html = await get_total_pages(client)
         print(f"Total listing pages discovered: {total_pages}")
 
         all_medicines = []
         seen_ids = set()
 
+        # Parse page 1 first so we have immediate results and diagnostic visibility
+        page1_items = extract_brands_from_html(first_html)
+        for item in page1_items:
+            if item["id"] not in seen_ids:
+                seen_ids.add(item["id"])
+                all_medicines.append(item)
+        print(f"Page 1 parsed: {len(all_medicines)} medicines")
+
         batch_size = 50
-        for start in range(1, total_pages + 1, batch_size):
+        for start in range(2, total_pages + 1, batch_size):
             end = min(start + batch_size - 1, total_pages)
             tasks = [fetch_listing_page(client, p, list_sem) for p in range(start, end + 1)]
             results = await asyncio.gather(*tasks)
@@ -412,15 +430,15 @@ async def main():
             )
 
         if not all_medicines:
+            snippet = clean_text(first_html)[:400]
             raise RuntimeError(
-                "Scraper fetched 0 medicines. Aborting to prevent overwriting data."
+                f"Scraper fetched 0 medicines. Page 1 HTML snippet: {snippet}"
             )
 
         all_medicines.sort(
             key=lambda x: (0, x["id"]) if isinstance(x["id"], int) else (1, str(x["id"]))
         )
 
-        # Scrape detail pages if requested
         targets = filter_brands_for_details(
             all_medicines,
             mode=args.details_mode,
@@ -457,7 +475,6 @@ async def main():
 
                 print(f"Saved detail batch {start + 1}-{start + len(chunk)}")
 
-    # Mark which medicines have local detail JSON available and build combined details index
     available_detail_ids = set()
     all_details_list = []
     if os.path.isdir("data/details"):
