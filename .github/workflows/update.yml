@@ -1,10 +1,40 @@
-name: Update BD Medicine Prices
+name: Update BD Medicine Prices & Details
 
 on:
   schedule:
     # Runs every Friday at 3:00 AM Bangladesh Time (Thursday 21:00 UTC)
     - cron: '0 21 * * 4'
   workflow_dispatch:
+    inputs:
+      details_mode:
+        description: 'Detail scrape mode: none | filter | all'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - filter
+          - all
+      filter_names:
+        description: 'Brand names (comma-separated, e.g. Napa,Seclo,Sergel) [used if mode=filter]'
+        required: false
+        default: ''
+      filter_generics:
+        description: 'Generic names (comma-separated, e.g. Paracetamol,Omeprazole) [used if mode=filter]'
+        required: false
+        default: ''
+      filter_ids:
+        description: 'Brand IDs (comma-separated, e.g. 1234,5678) [used if mode=filter]'
+        required: false
+        default: ''
+      details_limit:
+        description: 'Max detail pages per run (0 = unlimited; e.g. 2000 for safe batching)'
+        required: false
+        default: '0'
+      skip_existing_details:
+        description: 'Skip already scraped detail pages (true/false)'
+        required: true
+        default: 'true'
 
 permissions:
   contents: write
@@ -12,7 +42,7 @@ permissions:
 jobs:
   update-dataset:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -28,16 +58,23 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run MedEx Scraper
+        env:
+          DETAILS_MODE: ${{ github.event.inputs.details_mode || 'none' }}
+          FILTER_NAMES: ${{ github.event.inputs.filter_names || '' }}
+          FILTER_GENERICS: ${{ github.event.inputs.filter_generics || '' }}
+          FILTER_IDS: ${{ github.event.inputs.filter_ids || '' }}
+          DETAILS_LIMIT: ${{ github.event.inputs.details_limit || '0' }}
+          SKIP_EXISTING_DETAILS: ${{ github.event.inputs.skip_existing_details || 'true' }}
         run: python scraper.py
 
       - name: Commit and Push Updated Dataset
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/medicines.json data/version.json
+          git add data/
           if git diff --staged --quiet; then
-            echo "No price or medicine changes detected."
+            echo "No changes detected."
           else
-            git commit -m "chore: update medicine prices ($(date +'%Y-%m-%d'))"
+            git commit -m "chore: update medicine dataset ($(date +'%Y-%m-%d'))"
             git push
           fi

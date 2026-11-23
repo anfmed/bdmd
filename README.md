@@ -1,20 +1,23 @@
-# Bangladesh Medicine Price Dataset (Auto-Updating)
+# Bangladesh Medicine Price & Monograph Dataset (Auto-Updating)
 
-An automated, zero-cost pipeline using **GitHub Actions** to keep a structured JSON dataset of Bangladeshi medicine brands, generics, manufacturers, and prices up to date.
+An automated, zero-cost pipeline using **GitHub Actions** to scrape Bangladeshi medicine prices and clinical detail pages (Indications, Dosage & Administration, Side Effects, Pregnancy & Lactation, Precautions & Warnings, Interactions, Contraindications, Storage) from MedEx.
 
 ## Endpoints (GitHub Raw CDN)
 
 Replace `<USERNAME>` and `<REPO>` with your GitHub username and repository name:
 
-- **Metadata / Version Check:**
+- **Version & Stats:**
   `https://raw.githubusercontent.com/<USERNAME>/<REPO>/main/data/version.json`
-- **Full Dataset:**
+- **All Medicines (Prices + Summary):**
   `https://raw.githubusercontent.com/<USERNAME>/<REPO>/main/data/medicines.json`
+- **Combined Detailed Monographs:**
+  `https://raw.githubusercontent.com/<USERNAME>/<REPO>/main/data/medicine_details.json`
+- **Single Medicine Detail (by ID):**
+  `https://raw.githubusercontent.com/<USERNAME>/<REPO>/main/data/details/<BRAND_ID>.json`
 
-## Setup Instructions
+## Detail Scraping Modes (Manual or CLI)
 
-1. Push this repository to GitHub (`main` branch).
-2. Go to **Settings > Actions > General** in your repository.
-3. Under **Workflow permissions**, select **Read and write permissions** and click **Save**.
-4. Go to the **Actions** tab, select **Update BD Medicine Prices**, and click **Run workflow** to trigger the initial scrape.
-5. After that, the workflow automatically runs every Friday at 3:00 AM (BST) and commits updates only when data changes.
+When clicking **Run workflow** in GitHub Actions, you can choose:
+1. **`none`** *(default for weekly cron)*: Fast price & brand update (~2–3 mins).
+2. **`filter`**: Scrape detail pages only for matching brand names (`Napa,Seclo`), generics (`Paracetamol,Omeprazole`), or IDs.
+3. **`all`**: Scrape detail pages for all medicines. Use `details_limit` (e.g. `3000`) with `skip_existing_details: true` to safely build the full detail database across multiple runs without hitting rate limits.
