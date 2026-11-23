@@ -231,13 +231,10 @@ def extract_detail_from_html(html: str, brand: dict) -> dict:
 
         # Preserve line breaks for bullet/paragraph readability
         for br in body.find_all("br"):
-            br.replace_with("
-")
-        raw_body = body.get_text("
-", strip=True)
+            br.replace_with("\n")
+        raw_body = body.get_text("\n", strip=True)
         lines = [clean_text(line) for line in raw_body.splitlines() if clean_text(line)]
-        content = "
-".join(lines)
+        content = "\n".join(lines)
 
         if not title or not content:
             continue
